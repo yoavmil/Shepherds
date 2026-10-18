@@ -1,0 +1,6 @@
+{
+  "name": "Shepherd - Pastoral Herding Strategy Game",
+  "description": "A faithful browser remake of the tactical herding game Shepherd. Command 3 shepherds, harness flocking and flee AI, and pen the wandering sheep.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
