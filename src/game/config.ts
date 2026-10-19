@@ -15,10 +15,9 @@ export const GAME_CONFIG = {
     height: 931,
   },
 
-  // Pen settings (circular pen located near the center-right of the map)
+  // Pen settings (circular pen for default / single pen)
   pen: {
     radius: 110,
-    // Map center is (1106, 465.5). Center-right is ~1500, 465.5
     centerX: 1480,
     centerY: 465.5,
     normalFill: 'rgba(56, 161, 105, 0.28)',
@@ -27,6 +26,80 @@ export const GAME_CONFIG = {
     winFill: 'rgba(72, 199, 116, 0.45)',
     winStroke: 'rgba(104, 235, 148, 1)',
     winLineWidth: 8,
+  },
+
+  // Stage 1 configuration (Classic single pen)
+  stage1: {
+    name: 'Stage 1: Pastoral Meadow',
+    description: 'Gather all 4 sheep into the circular pasture pen.',
+    shepherdsStart: {
+      x: 756,
+      ys: [315.5, 465.5, 615.5],
+    },
+    sheepPositions: [
+      { x: 1360, y: 240 },
+      { x: 1720, y: 220 },
+      { x: 1390, y: 710 },
+      { x: 1780, y: 680 },
+    ],
+    pens: [
+      {
+        id: 1,
+        centerX: 1480,
+        centerY: 465.5,
+        radius: 110,
+        label: 'PEN 1',
+      },
+    ],
+    hasRiver: false,
+  },
+
+  // Stage 2 configuration (River, bridge crossing, and 3 sequential pens)
+  stage2: {
+    name: 'Stage 2: River Crossing & 3 Pens',
+    description: 'Herd sheep sequentially with 2 shepherds: Pen 1 ➔ Cross Bridge to Pen 2 ➔ Final Pen 3.',
+    river: {
+      xMin: 1040,
+      xMax: 1190,
+      bridgeYMin: 395,
+      bridgeYMax: 535,
+      bridgeXMin: 1020,
+      bridgeXMax: 1210,
+    },
+    shepherdsStart: {
+      x: 350,
+      ys: [390, 540], // 2 Shepherds for Stage 2
+    },
+    sheepPositions: [
+      { x: 620, y: 410 },
+      { x: 690, y: 560 },
+      { x: 740, y: 320 },
+      { x: 790, y: 610 },
+    ],
+    pens: [
+      {
+        id: 1,
+        centerX: 550,
+        centerY: 240,
+        radius: 105,
+        label: 'PEN 1',
+      },
+      {
+        id: 2,
+        centerX: 1560,
+        centerY: 280,
+        radius: 105,
+        label: 'PEN 2',
+      },
+      {
+        id: 3,
+        centerX: 1760,
+        centerY: 720,
+        radius: 105,
+        label: 'PEN 3',
+      },
+    ],
+    hasRiver: true,
   },
 
   // Shepherd parameters
@@ -67,6 +140,12 @@ export const GAME_CONFIG = {
   },
 
   // Controls & Camera
+  camera: {
+    minZoom: 0.35,
+    maxZoom: 2.2,
+    defaultZoom: 1.0,
+    zoomStep: 0.15,
+  },
   input: {
     dragThreshold: 5, // >5px movement = drag/pan, otherwise click/tap
     rippleStartRadius: 8,

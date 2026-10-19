@@ -8,25 +8,33 @@
 // ============================================================================
 // Orchestrates the 60Hz fixed-timestep physics update, requestAnimationFrame loop,
 // camera viewport clamping, touch & mouse input handling, formation target dispatch,
-// and win-condition checks.
+// stage selection (Stage 1 & Stage 2 River Crossing with 3 Pens), and win checks.
 
-import { calculateSheepSteering, clampToMap, updateSheep, updateShepherds } from './ai';
+import { clampEntityPosition, isPointInRiverWater, planShepherdPath, updateSheep, updateShepherds } from './ai';
 import { assetManager } from './assets';
 import { sounds } from './audio';
 import { GAME_CONFIG } from './config';
 import { gameRenderer } from './renderer';
-import { Camera, Direction4, Direction8, GameState, SheepEntity, ShepherdEntity, Vector2 } from './types';
+import { Camera, Direction4, GameState, SheepEntity, ShepherdEntity, StageId, Vector2 } from './types';
 
 export class GameEngine {
   public canvas: HTMLCanvasElement | null = null;
   public ctx: CanvasRenderingContext2D | null = null;
 
   public state: GameState = {
+    stage: 1,
+    activePenIndex: 0,
+    completedPens: [false],
     shepherds: [],
     sheep: [],
     ripples: [],
     isWon: false,
     winTime: null,
+    stageStartTime: null,
+    timerStarted: false,
+    completionTimeSeconds: null,
+    commandCount: 0,
+    stageNotification: null,
   };
 
   public camera: Camera = {
@@ -34,6 +42,7 @@ export class GameEngine {
     y: 0,
     viewportWidth: 800,
     viewportHeight: 600,
+    zoom: GAME_CONFIG.camera.defaultZoom,
   };
 
   private isRunning: boolean = false;
@@ -52,36 +61,42 @@ export class GameEngine {
   private cameraStartY: number = 0;
   private hasDragged: boolean = false;
 
-  // Callback to sync React UI buttons
-  public onStateChange?: (shepherds: ShepherdEntity[], isWon: boolean) => void;
+  // Multi-touch pinch-to-zoom tracking
+  private activePointers = new Map<number, { x: number; y: number }>();
+  private pinchInitialDistance: number = 0;
+  private pinchInitialZoom: number = 1.0;
+
+  // Callbacks to sync React UI
+  public onStateChange?: (shepherds: ShepherdEntity[], isWon: boolean, state: GameState) => void;
+  public onZoomChange?: (zoom: number) => void;
 
   constructor() {
-    this.reset();
+    this.reset(1);
+  }
+
+  // Switch stage
+  public setStage(stageId: StageId) {
+    this.reset(stageId);
   }
 
   // Initialize or restart all entities to their starting positions
-  public reset() {
-    const mapCenter = {
-      x: GAME_CONFIG.world.width / 2,
-      y: GAME_CONFIG.world.height / 2,
-    };
+  public reset(stageId: StageId = this.state.stage || 1) {
+    const stageCfg = stageId === 1 ? GAME_CONFIG.stage1 : GAME_CONFIG.stage2;
 
-    // 3 Shepherds: start on left side, x ~ -350 from map center, spaced vertically 150px apart
+    // Shepherds setup - Stage 1 has 3 shepherds, Stage 2 has 2 shepherds
     const shepherds: ShepherdEntity[] = [];
-    const shStartX = mapCenter.x + GAME_CONFIG.shepherd.startOffsetX; // ~756
-    const startYs = [
-      mapCenter.y - GAME_CONFIG.shepherd.verticalSpacing, // 315.5
-      mapCenter.y,                                         // 465.5
-      mapCenter.y + GAME_CONFIG.shepherd.verticalSpacing, // 615.5
-    ];
+    const shStartX = stageCfg.shepherdsStart.x;
+    const startYs = stageCfg.shepherdsStart.ys;
 
-    for (let i = 0; i < GAME_CONFIG.shepherd.count; i++) {
+    for (let i = 0; i < startYs.length; i++) {
       shepherds.push({
         id: i,
         x: shStartX,
         y: startYs[i],
         radius: GAME_CONFIG.shepherd.collisionRadius,
         target: null,
+        waypoint: null,
+        waypoints: [],
         direction: 'e',
         isMoving: false,
         selected: false,
@@ -93,21 +108,15 @@ export class GameEngine {
       });
     }
 
-    // 4 Sheep: scattered across the right-hand part of the map
-    // Each sheep randomly gets sheep or ram sprites (50/50). Initial facing is random.
+    // Sheep setup
     const directions4: Direction4[] = ['e', 's', 'w', 'n'];
     const sheep: SheepEntity[] = [];
-    const presetPositions = [
-      { x: 1360, y: 240 },
-      { x: 1720, y: 220 },
-      { x: 1390, y: 710 },
-      { x: 1780, y: 680 },
-    ];
+    const presetPositions = stageCfg.sheepPositions;
 
     for (let i = 0; i < GAME_CONFIG.sheep.count; i++) {
       const pos = presetPositions[i] || {
-        x: 1350 + Math.random() * 450,
-        y: 200 + Math.random() * 500,
+        x: 600 + Math.random() * 200,
+        y: 300 + Math.random() * 300,
       };
       sheep.push({
         id: i,
@@ -124,15 +133,33 @@ export class GameEngine {
       });
     }
 
+    const penCount = stageCfg.pens.length;
+    const completedPens = new Array(penCount).fill(false);
+
     this.state = {
+      stage: stageId,
+      activePenIndex: 0,
+      completedPens,
       shepherds,
       sheep,
       ripples: [],
       isWon: false,
       winTime: null,
+      stageStartTime: null,
+      timerStarted: false,
+      completionTimeSeconds: null,
+      commandCount: 0,
+      stageNotification:
+        stageId === 2
+          ? {
+              message: 'Stage 2: River Crossing (2 Shepherds)',
+              submessage: 'Herd the sheep into Pen 1 first!',
+              timestamp: Date.now(),
+            }
+          : null,
     };
 
-    // Center camera on the action
+    // Center camera on the starting action
     this.centerCameraInitial();
     this.notifyState();
   }
@@ -148,19 +175,24 @@ export class GameEngine {
 
     // Event listeners
     window.addEventListener('resize', this.handleResize);
+    window.addEventListener('orientationchange', this.handleOrientationChange);
     canvas.addEventListener('pointerdown', this.handlePointerDown);
     window.addEventListener('pointermove', this.handlePointerMove);
     window.addEventListener('pointerup', this.handlePointerUp);
     window.addEventListener('pointercancel', this.handlePointerUp);
+    canvas.addEventListener('wheel', this.handleWheel, { passive: false });
 
     this.start();
   }
 
+  // Unmount canvas
   public detach() {
     this.stop();
     window.removeEventListener('resize', this.handleResize);
+    window.removeEventListener('orientationchange', this.handleOrientationChange);
     if (this.canvas) {
       this.canvas.removeEventListener('pointerdown', this.handlePointerDown);
+      this.canvas.removeEventListener('wheel', this.handleWheel);
     }
     window.removeEventListener('pointermove', this.handlePointerMove);
     window.removeEventListener('pointerup', this.handlePointerUp);
@@ -169,59 +201,142 @@ export class GameEngine {
     this.ctx = null;
   }
 
-  // Handle window and viewport resizing
+  // Handle window resize and re-clamp camera
   public handleResize = () => {
     if (!this.canvas) return;
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-    this.canvas.width = w;
-    this.canvas.height = h;
-    this.camera.viewportWidth = w;
-    this.camera.viewportHeight = h;
+
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+
+    this.canvas.width = width;
+    this.canvas.height = height;
+
+    this.camera.viewportWidth = width;
+    this.camera.viewportHeight = height;
+
     this.clampCamera();
   };
 
+  private handleOrientationChange = () => {
+    setTimeout(() => {
+      this.handleResize();
+    }, 200);
+  };
+
+  // Set zoom level and clamp camera
+  public setZoom(newZoom: number) {
+    const minZ = GAME_CONFIG.camera.minZoom;
+    const maxZ = GAME_CONFIG.camera.maxZoom;
+    const clampedZoom = Math.max(minZ, Math.min(maxZ, newZoom));
+
+    if (Math.abs(clampedZoom - this.camera.zoom) < 0.001) return;
+
+    // Zoom centered on the viewport middle
+    const screenCenterX = this.camera.viewportWidth / 2;
+    const screenCenterY = this.camera.viewportHeight / 2;
+    const worldCenterBefore = this.screenToWorld(screenCenterX, screenCenterY);
+
+    this.camera.zoom = clampedZoom;
+
+    // Adjust camera x/y so world center remains under the screen center
+    this.camera.x = worldCenterBefore.x - screenCenterX / this.camera.zoom;
+    this.camera.y = worldCenterBefore.y - screenCenterY / this.camera.zoom;
+
+    this.clampCamera();
+    this.onZoomChange?.(this.camera.zoom);
+  }
+
+  public zoomIn() {
+    this.setZoom(this.camera.zoom + GAME_CONFIG.camera.zoomStep);
+  }
+
+  public zoomOut() {
+    this.setZoom(this.camera.zoom - GAME_CONFIG.camera.zoomStep);
+  }
+
+  // Mouse wheel zoom
+  private handleWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+    this.setZoom(this.camera.zoom * zoomFactor);
+  };
+
+  // Center camera initially
   private centerCameraInitial() {
-    // Focus on the midpoint between shepherds and pen
-    const targetCenterX = 1120;
-    const targetCenterY = GAME_CONFIG.world.height / 2;
-    this.camera.x = targetCenterX - this.camera.viewportWidth / 2;
-    this.camera.y = targetCenterY - this.camera.viewportHeight / 2;
+    const defaultZoom = GAME_CONFIG.camera.defaultZoom;
+    this.camera.zoom = defaultZoom;
+
+    if (this.state.stage === 2) {
+      // Focus on the shepherds and Pen 1 area (West bank)
+      const targetCenterX = 650;
+      const targetCenterY = 465.5;
+      this.camera.x = targetCenterX - this.camera.viewportWidth / (2 * defaultZoom);
+      this.camera.y = targetCenterY - this.camera.viewportHeight / (2 * defaultZoom);
+    } else {
+      // Center of world
+      const mapCenterX = GAME_CONFIG.world.width / 2;
+      const mapCenterY = GAME_CONFIG.world.height / 2;
+      this.camera.x = mapCenterX - this.camera.viewportWidth / (2 * defaultZoom);
+      this.camera.y = mapCenterY - this.camera.viewportHeight / (2 * defaultZoom);
+    }
+
     this.clampCamera();
   }
 
-  // Clamp camera so it never shows outside the 2212x931 map
+  // Clamps camera so it NEVER shows outside the map
   private clampCamera() {
-    const mapW = GAME_CONFIG.world.width;
-    const mapH = GAME_CONFIG.world.height;
+    const worldW = GAME_CONFIG.world.width;
+    const worldH = GAME_CONFIG.world.height;
+    const viewW = this.camera.viewportWidth / this.camera.zoom;
+    const viewH = this.camera.viewportHeight / this.camera.zoom;
 
-    if (this.camera.viewportWidth >= mapW) {
-      this.camera.x = (mapW - this.camera.viewportWidth) / 2;
+    // Clamp X
+    if (viewW >= worldW) {
+      this.camera.x = (worldW - viewW) / 2;
     } else {
-      this.camera.x = Math.max(0, Math.min(mapW - this.camera.viewportWidth, this.camera.x));
+      this.camera.x = Math.max(0, Math.min(worldW - viewW, this.camera.x));
     }
 
-    if (this.camera.viewportHeight >= mapH) {
-      this.camera.y = (mapH - this.camera.viewportHeight) / 2;
+    // Clamp Y
+    if (viewH >= worldH) {
+      this.camera.y = (worldH - viewH) / 2;
     } else {
-      this.camera.y = Math.max(0, Math.min(mapH - this.camera.viewportHeight, this.camera.y));
+      this.camera.y = Math.max(0, Math.min(worldH - viewH, this.camera.y));
     }
   }
 
-  // Convert screen coordinates to world coordinates
-  public screenToWorld(sx: number, sy: number): Vector2 {
+  // Convert Screen Coordinates (pixels) to World Coordinates
+  public screenToWorld(screenX: number, screenY: number): Vector2 {
     return {
-      x: sx + this.camera.x,
-      y: sy + this.camera.y,
+      x: this.camera.x + screenX / this.camera.zoom,
+      y: this.camera.y + screenY / this.camera.zoom,
+    };
+  }
+
+  // Convert World Coordinates to Screen Coordinates
+  public worldToScreen(worldX: number, worldY: number): Vector2 {
+    return {
+      x: (worldX - this.camera.x) * this.camera.zoom,
+      y: (worldY - this.camera.y) * this.camera.zoom,
     };
   }
 
   // ============================================================================
-  // INPUT HANDLING (Click vs Drag)
+  // INPUT HANDLING (Mouse & Mobile Touch)
   // ============================================================================
   private handlePointerDown = (e: PointerEvent) => {
-    // Left click or touch
-    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    // Only handle primary clicks or multi-touch
+    this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // Multi-touch pinch detection
+    if (this.activePointers.size === 2) {
+      const pts = Array.from(this.activePointers.values());
+      this.pinchInitialDistance = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      this.pinchInitialZoom = this.camera.zoom;
+      return;
+    }
+
+    if (this.activePointers.size > 2) return;
 
     this.isPointerDown = true;
     this.hasDragged = false;
@@ -234,6 +349,21 @@ export class GameEngine {
   };
 
   private handlePointerMove = (e: PointerEvent) => {
+    if (this.activePointers.has(e.pointerId)) {
+      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+
+    // Pinch-to-zoom update
+    if (this.activePointers.size === 2) {
+      const pts = Array.from(this.activePointers.values());
+      const currentDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (this.pinchInitialDistance > 5) {
+        const ratio = currentDist / this.pinchInitialDistance;
+        this.setZoom(this.pinchInitialZoom * ratio);
+      }
+      return;
+    }
+
     if (!this.isPointerDown) return;
 
     this.pointerCurrentX = e.clientX;
@@ -243,41 +373,50 @@ export class GameEngine {
     const dy = this.pointerCurrentY - this.pointerStartY;
     const dist = Math.hypot(dx, dy);
 
-    // Rule: >5px movement = drag, otherwise click/tap
+    // Threshold: >5px movement = drag/pan
     if (dist > GAME_CONFIG.input.dragThreshold) {
       this.hasDragged = true;
-      // Pan camera inversely
-      this.camera.x = this.cameraStartX - dx;
-      this.camera.y = this.cameraStartY - dy;
+      this.camera.x = this.cameraStartX - dx / this.camera.zoom;
+      this.camera.y = this.cameraStartY - dy / this.camera.zoom;
       this.clampCamera();
     }
   };
 
   private handlePointerUp = (e: PointerEvent) => {
+    this.activePointers.delete(e.pointerId);
+
+    if (this.activePointers.size === 1) {
+      // Transition from pinch back to pan
+      const pt = Array.from(this.activePointers.values())[0];
+      this.pointerStartX = pt.x;
+      this.pointerStartY = pt.y;
+      this.cameraStartX = this.camera.x;
+      this.cameraStartY = this.camera.y;
+      return;
+    }
+
     if (!this.isPointerDown) return;
     this.isPointerDown = false;
 
-    // If it was not a drag (>5px), treat it as a click/tap
+    // If not dragged beyond 5px threshold, handle as a click/tap
     if (!this.hasDragged) {
-      this.handleClick(e.clientX, e.clientY);
+      this.handleClickOrTap(this.pointerStartX, this.pointerStartY);
     }
   };
 
-  // Process Click or Tap
-  private handleClick(screenX: number, screenY: number) {
+  // Process Click or Tap on canvas
+  private handleClickOrTap(screenX: number, screenY: number) {
+    this.startTimerIfNeeded();
+
     const worldPos = this.screenToWorld(screenX, screenY);
 
-    // 1. Check if clicking on a shepherd (within 32px click radius)
-    // Rule: Clicking a shepherd (within 32px) selects ONLY that shepherd and syncs the buttons.
-    // Clicking the only-selected shepherd deselects it.
+    // 1. Check if clicked a shepherd (within clickRadius 32px)
     let clickedShepherd: ShepherdEntity | null = null;
-    let closestDist = Infinity;
-
     for (const sh of this.state.shepherds) {
-      const d = Math.hypot(worldPos.x - sh.x, worldPos.y - sh.y);
-      if (d <= GAME_CONFIG.shepherd.clickRadius && d < closestDist) {
+      const d = Math.hypot(sh.x - worldPos.x, sh.y - worldPos.y);
+      if (d <= GAME_CONFIG.shepherd.clickRadius) {
         clickedShepherd = sh;
-        closestDist = d;
+        break;
       }
     }
 
@@ -300,14 +439,13 @@ export class GameEngine {
     }
 
     // 2. Click on ground:
-    // Rule: all selected shepherds walk to that point, keeping their relative formation
-    // (each target = click + (shepherd position - centroid of selected)), clamped to the map.
+    // All selected shepherds walk to that point, keeping relative formation
     const selected = this.state.shepherds.filter((s) => s.selected);
     if (selected.length === 0) {
-      return; // No shepherds selected
+      return;
     }
 
-    // Calculate centroid of selected shepherds
+    // Centroid of selected shepherds
     let sumX = 0;
     let sumY = 0;
     for (const s of selected) {
@@ -317,19 +455,43 @@ export class GameEngine {
     const centroidX = sumX / selected.length;
     const centroidY = sumY / selected.length;
 
-    // Play whistle audio
+    // Whistle audio and increment command counter
     sounds.playCommandWhistle();
+    this.state.commandCount++;
+
+    // In Stage 2, if ground target clicked is in river water, snap target to nearest bank or bridge
+    let targetGroundX = worldPos.x;
+    let targetGroundY = worldPos.y;
+
+    if (this.state.stage === 2 && isPointInRiverWater(targetGroundX, targetGroundY, 0, 2)) {
+      const river = GAME_CONFIG.stage2.river;
+      const bridgeCenterY = (river.bridgeYMin + river.bridgeYMax) / 2;
+      const distToBridge = Math.abs(targetGroundY - bridgeCenterY);
+
+      if (distToBridge < 120) {
+        targetGroundY = bridgeCenterY;
+      } else {
+        // Snap to closest bank
+        targetGroundX =
+          Math.abs(targetGroundX - river.xMin) < Math.abs(targetGroundX - river.xMax)
+            ? river.xMin - 35
+            : river.xMax + 35;
+      }
+    }
 
     // Assign formation targets and spawn ripples
     for (const sh of selected) {
       const offsetX = sh.x - centroidX;
       const offsetY = sh.y - centroidY;
-      const rawTargetX = worldPos.x + offsetX;
-      const rawTargetY = worldPos.y + offsetY;
+      const rawTargetX = targetGroundX + offsetX;
+      const rawTargetY = targetGroundY + offsetY;
 
-      // Clamp target to map
-      const clamped = clampToMap(rawTargetX, rawTargetY, sh.radius);
+      // Clamp target to map and river
+      const clamped = clampEntityPosition(rawTargetX, rawTargetY, sh.radius, this.state.stage);
       sh.target = clamped;
+      sh.waypoints = planShepherdPath(sh.x, sh.y, clamped.x, clamped.y, this.state.stage, sh.id);
+      sh.waypoint = sh.waypoints[0] || null;
+      sh.isMoving = true;
       sh.stuckFrameCount = 0;
       sh.lastStuckCheckX = sh.x;
       sh.lastStuckCheckY = sh.y;
@@ -355,8 +517,18 @@ export class GameEngine {
   // ============================================================================
   // UI COMMANDS
   // ============================================================================
-  // Toggle selection for C1 (id=0), C2 (id=1), C3 (id=2)
+  // Starts stage timer on the very first player click/action
+  public startTimerIfNeeded() {
+    if (!this.state.timerStarted || this.state.stageStartTime === null) {
+      this.state.timerStarted = true;
+      this.state.stageStartTime = Date.now();
+      this.notifyState();
+    }
+  }
+
+  // Toggle selection for C1, C2, C3
   public toggleShepherdSelection(id: number) {
+    this.startTimerIfNeeded();
     const sh = this.state.shepherds.find((s) => s.id === id);
     if (sh) {
       sh.selected = !sh.selected;
@@ -366,6 +538,7 @@ export class GameEngine {
 
   // Select all shepherds
   public selectAllShepherds() {
+    this.startTimerIfNeeded();
     for (const sh of this.state.shepherds) {
       sh.selected = true;
     }
@@ -374,8 +547,11 @@ export class GameEngine {
 
   // Stop All: cancels all shepherd movement
   public stopAll() {
+    this.startTimerIfNeeded();
     for (const sh of this.state.shepherds) {
       sh.target = null;
+      sh.waypoint = null;
+      sh.waypoints = [];
       sh.isMoving = false;
       sh.stuckFrameCount = 0;
     }
@@ -384,7 +560,7 @@ export class GameEngine {
 
   private notifyState() {
     if (this.onStateChange) {
-      this.onStateChange([...this.state.shepherds], this.state.isWon);
+      this.onStateChange([...this.state.shepherds], this.state.isWon, { ...this.state });
     }
   }
 
@@ -438,13 +614,19 @@ export class GameEngine {
     this.animationFrameId = requestAnimationFrame(this.loop);
   };
 
-  // Fixed 60Hz physics and AI update
+  // Fixed 60Hz physics, AI, and stage objective update
   private fixedUpdate(dt: number) {
     // 1. Update shepherds
-    updateShepherds(this.state.shepherds, dt);
+    updateShepherds(this.state.shepherds, dt, this.state.stage);
 
     // 2. Update sheep flocking & flee AI
-    updateSheep(this.state.sheep, this.state.shepherds, dt);
+    updateSheep(
+      this.state.sheep,
+      this.state.shepherds,
+      dt,
+      this.state.stage,
+      this.state.activePenIndex
+    );
 
     // 3. Update ripples
     for (let i = this.state.ripples.length - 1; i >= 0; i--) {
@@ -455,14 +637,55 @@ export class GameEngine {
       }
     }
 
-    // 4. Check win condition
-    // WIN: when all 4 sheep centres are within the pen radius
+    // 4. Check stage objective & win conditions
     const allInPen = this.state.sheep.every((s) => s.isInPen);
+
     if (allInPen && !this.state.isWon) {
-      this.state.isWon = true;
-      this.state.winTime = performance.now();
-      sounds.playWinFanfare();
-      this.notifyState();
+      if (this.state.stage === 1) {
+        // Stage 1 Victory
+        this.state.isWon = true;
+        this.state.winTime = performance.now();
+        this.state.completionTimeSeconds = this.state.stageStartTime
+          ? Math.max(0.1, (Date.now() - this.state.stageStartTime) / 1000)
+          : 0.1;
+        sounds.playWinFanfare();
+        this.notifyState();
+      } else if (this.state.stage === 2) {
+        // Stage 2 Sequential progression: Pen 1 -> Pen 2 -> Pen 3
+        if (this.state.activePenIndex === 0) {
+          // Pen 1 Complete! Move to Pen 2 (across the river!)
+          this.state.completedPens[0] = true;
+          this.state.activePenIndex = 1;
+          this.state.stageNotification = {
+            message: 'Pen 1 Cleared! (Step 1/3)',
+            submessage: 'Now guide the sheep across the river bridge to Pen 2!',
+            timestamp: Date.now(),
+          };
+          sounds.playCheckpointChime();
+          this.notifyState();
+        } else if (this.state.activePenIndex === 1) {
+          // Pen 2 Complete! Move to Pen 3
+          this.state.completedPens[1] = true;
+          this.state.activePenIndex = 2;
+          this.state.stageNotification = {
+            message: 'Pen 2 Cleared! (Step 2/3)',
+            submessage: 'Awesome river crossing! Final step: herd them to Pen 3!',
+            timestamp: Date.now(),
+          };
+          sounds.playCheckpointChime();
+          this.notifyState();
+        } else if (this.state.activePenIndex === 2) {
+          // Pen 3 Complete! Stage 2 Victory!
+          this.state.completedPens[2] = true;
+          this.state.isWon = true;
+          this.state.winTime = performance.now();
+          this.state.completionTimeSeconds = this.state.stageStartTime
+            ? Math.max(0.1, (Date.now() - this.state.stageStartTime) / 1000)
+            : 0.1;
+          sounds.playWinFanfare();
+          this.notifyState();
+        }
+      }
     }
   }
 }

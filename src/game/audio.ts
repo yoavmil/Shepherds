@@ -126,6 +126,42 @@ class SoundManager {
     }
   }
 
+  // Stage pen checkpoint progression chime
+  public playCheckpointChime() {
+    if (!this.enabled) return;
+    this.initContext();
+    if (!this.ctx) return;
+
+    try {
+      const now = this.ctx.currentTime;
+      const notes = [
+        { f: 587.33, t: 0, d: 0.14 },    // D5
+        { f: 880.00, t: 0.12, d: 0.32 }, // A5
+        { f: 1174.66, t: 0.25, d: 0.35 }, // D6
+      ];
+
+      notes.forEach(({ f, t, d }) => {
+        const osc = this.ctx!.createOscillator();
+        const gain = this.ctx!.createGain();
+
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(f, now + t);
+
+        gain.gain.setValueAtTime(0.001, now + t);
+        gain.gain.linearRampToValueAtTime(0.14, now + t + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + t + d);
+
+        osc.connect(gain);
+        gain.connect(this.ctx!.destination);
+
+        osc.start(now + t);
+        osc.stop(now + t + d + 0.05);
+      });
+    } catch {
+      // Ignore
+    }
+  }
+
   // Big triumphant victory fanfare!
   public playWinFanfare() {
     if (!this.enabled) return;
